@@ -11,7 +11,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Agent Chat",
+  title: "RevupAI Chat",
   description: "Agent Chat UX by RevupAI",
   icons: {
     icon: "/revupai.png",

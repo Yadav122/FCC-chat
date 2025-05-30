@@ -15,9 +15,13 @@ export function RevupAILogoSVG({
       alt="RevupAI Logo"
       width={width}
       height={height}
-      className={className ? className.replace(/h-\d+/, '') : ''}
+      className={className}
       priority
-      style={{ height: `${height}px`, width: `${width}px` }}
+      style={{
+        height: className?.includes('h-') ? undefined : `${height}px`,
+        width: className?.includes('w-') ? undefined : `${width}px`,
+        objectFit: 'contain'
+      }}
     />
   );
 }
