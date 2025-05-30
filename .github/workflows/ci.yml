@@ -33,6 +33,9 @@ jobs:
       - name: Build application
         run: pnpm build
         
+      - name: List build output
+        run: ls -l
+      
       - name: Create deployment archive
         run: |
           tar -czf deployment.tar.gz dist/ package.json pnpm-lock.yaml
