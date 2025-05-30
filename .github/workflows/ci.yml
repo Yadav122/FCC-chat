@@ -1,5 +1,6 @@
 name: Fixed Next.js Deployment
 
+
 on:
   push:
     branches: ["main"]
