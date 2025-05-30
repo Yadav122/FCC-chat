@@ -122,6 +122,223 @@ jobs:
             $([ -f "next.config.js" ] && echo "next.config.js" || echo "")
           
           echo "✅ Deployment package created ($(du -h deployment.tar.gz | cut -f1))"
+
+      - name: Create setup script
+        run: |
+          cat > setup-server.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+          echo "🚀 Starting automated server setup..."
+          
+          SETUP_FLAG="/home/${{ secrets.EC2_USERNAME }}/.server_setup_complete"
+          
+          if [ ! -f "$SETUP_FLAG" ]; then
+            echo "🔧 First time setup - Installing all dependencies..."
+            
+            # Detect OS type
+            if [ -f /etc/os-release ]; then
+              . /etc/os-release
+              OS=$ID
+            else
+              OS=$(uname -s)
+            fi
+            
+            echo "Detected OS: $OS"
+            
+            # Update system based on OS
+            if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+              echo "📦 Updating Ubuntu/Debian packages..."
+              sudo apt update -y
+              sudo apt install -y curl wget git tar gzip nginx htop
+            elif [[ "$OS" == "amzn" || "$OS" == "rhel" || "$OS" == "centos" ]]; then
+              echo "📦 Updating Amazon Linux/RHEL/CentOS packages..."
+              sudo yum update -y
+              
+              # Install nginx for Amazon Linux 2
+              if [[ "$OS" == "amzn" ]]; then
+                sudo amazon-linux-extras install -y epel
+                sudo yum install -y nginx
+              else
+                sudo yum install -y epel-release
+                sudo yum install -y nginx
+              fi
+              
+              sudo yum install -y curl wget git tar gzip htop
+            else
+              echo "Unsupported OS, attempting generic installation..."
+              sudo yum update -y || sudo apt update -y
+              sudo yum install -y curl wget git tar gzip nginx htop || sudo apt install -y curl wget git tar gzip nginx htop
+            fi
+            
+            # Verify nginx installation
+            if ! command -v nginx &> /dev/null; then
+              echo "❌ Nginx installation failed"
+              exit 1
+            fi
+            
+            # Install Node.js via NVM
+            echo "📦 Installing Node.js..."
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+            
+            nvm install 18
+            nvm use 18
+            nvm alias default 18
+            
+            # Add Node to PATH permanently
+            echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc
+            echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.bashrc
+            echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc
+            
+            # Verify Node installation
+            node --version || {
+              echo "❌ Node.js installation failed"
+              exit 1
+            }
+            
+            # Install pnpm and PM2
+            echo "📦 Installing pnpm and PM2..."
+            npm install -g pnpm pm2
+            
+            # Verify installations
+            pnpm --version || {
+              echo "❌ pnpm installation failed"
+              exit 1
+            }
+            
+            pm2 --version || {
+              echo "❌ PM2 installation failed"
+              exit 1
+            }
+            
+            # Setup PM2 startup with better error handling
+            echo "🔧 Setting up PM2 startup..."
+            pm2 startup systemd -u ${{ secrets.EC2_USERNAME }} --hp /home/${{ secrets.EC2_USERNAME }} | grep -E '^sudo' | bash || {
+              echo "⚠️ PM2 startup setup failed, continuing..."
+            }
+            
+            # Configure Nginx
+            echo "🌐 Configuring Nginx..."
+            sudo systemctl enable nginx
+            sudo systemctl start nginx
+            
+            # Create Nginx config file
+            sudo tee /tmp/nextjs.conf > /dev/null <<NGINX_EOF
+          server {
+            listen 80;
+            server_name _;
+            
+            # Security headers
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            
+            # Gzip compression
+            gzip on;
+            gzip_vary on;
+            gzip_min_length 1000;
+            gzip_types
+              text/plain
+              text/css
+              text/js
+              text/xml
+              text/javascript
+              application/javascript
+              application/xml+rss
+              application/json;
+            
+            location / {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade \$http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host \$host;
+              proxy_set_header X-Real-IP \$remote_addr;
+              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto \$scheme;
+              proxy_cache_bypass \$http_upgrade;
+              proxy_read_timeout 86400s;
+              proxy_send_timeout 86400s;
+              proxy_connect_timeout 60s;
+            }
+            
+            # Static files caching
+            location /_next/static/ {
+              proxy_pass http://127.0.0.1:3000;
+              expires 1y;
+              add_header Cache-Control "public, immutable";
+            }
+            
+            # Health check
+            location /health {
+              access_log off;
+              return 200 "healthy\n";
+              add_header Content-Type text/plain;
+            }
+          }
+          NGINX_EOF
+            
+            # Move config to appropriate location
+            if [ -d "/etc/nginx/sites-available" ]; then
+              sudo mv /tmp/nextjs.conf /etc/nginx/sites-available/nextjs
+              sudo ln -sf /etc/nginx/sites-available/nextjs /etc/nginx/sites-enabled/
+              sudo rm -f /etc/nginx/sites-enabled/default
+            else
+              sudo mv /tmp/nextjs.conf /etc/nginx/conf.d/nextjs.conf
+            fi
+            
+            # Test and restart Nginx
+            sudo nginx -t || {
+              echo "❌ Nginx configuration test failed"
+              exit 1
+            }
+            sudo systemctl restart nginx
+            
+            # Create application directory
+            sudo mkdir -p /var/www/nextjs-app
+            sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/www/nextjs-app
+            
+            # Create log directories
+            sudo mkdir -p /var/log/pm2
+            sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/log/pm2
+            
+            # Mark setup as complete
+            touch "$SETUP_FLAG"
+            echo "✅ Server setup completed successfully!"
+            
+          else
+            echo "✅ Server already configured, skipping setup..."
+          fi
+          
+          # Always ensure services are running
+          echo "🔄 Ensuring services are running..."
+          sudo systemctl start nginx
+          sudo systemctl status nginx --no-pager
+          
+          # Source environment
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          echo "📊 System status:"
+          echo "Node version: $(node --version)"
+          echo "npm version: $(npm --version)"
+          echo "pnpm version: $(pnpm --version)"
+          echo "PM2 version: $(pm2 --version)"
+          SCRIPT_EOF
+          
+          chmod +x setup-server.sh
+
+      - name: Copy setup script to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          source: "setup-server.sh"
+          target: "/tmp/"
+          timeout: 300s
           
       - name: Setup Server (First Time Only)
         uses: appleboy/ssh-action@v1.0.3
@@ -132,202 +349,10 @@ jobs:
           port: ${{ secrets.EC2_SSH_PORT }}
           timeout: 600s
           script: |
-            echo "🚀 Starting automated server setup..."
-            
-            SETUP_FLAG="/home/${{ secrets.EC2_USERNAME }}/.server_setup_complete"
-            
-            if [ ! -f "$SETUP_FLAG" ]; then
-              echo "🔧 First time setup - Installing all dependencies..."
-              
-              # Detect OS type
-              if [ -f /etc/os-release ]; then
-                . /etc/os-release
-                OS=$ID
-              else
-                OS=$(uname -s)
-              fi
-              
-              echo "Detected OS: $OS"
-              
-              # Update system based on OS
-              if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-                echo "📦 Updating Ubuntu/Debian packages..."
-                sudo apt update -y
-                sudo apt install -y curl wget git tar gzip nginx htop
-              elif [[ "$OS" == "amzn" || "$OS" == "rhel" || "$OS" == "centos" ]]; then
-                echo "📦 Updating Amazon Linux/RHEL/CentOS packages..."
-                sudo yum update -y
-                
-                # Install nginx for Amazon Linux 2
-                if [[ "$OS" == "amzn" ]]; then
-                  sudo amazon-linux-extras install -y epel
-                  sudo yum install -y nginx
-                else
-                  sudo yum install -y epel-release
-                  sudo yum install -y nginx
-                fi
-                
-                sudo yum install -y curl wget git tar gzip htop
-              else
-                echo "Unsupported OS, attempting generic installation..."
-                sudo yum update -y || sudo apt update -y
-                sudo yum install -y curl wget git tar gzip nginx htop || sudo apt install -y curl wget git tar gzip nginx htop
-              fi
-              
-              # Verify nginx installation
-              if ! command -v nginx &> /dev/null; then
-                echo "❌ Nginx installation failed"
-                exit 1
-              fi
-              
-              # Install Node.js via NVM
-              echo "📦 Installing Node.js..."
-              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-              export NVM_DIR="$HOME/.nvm"
-              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-              [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-              
-              nvm install 18
-              nvm use 18
-              nvm alias default 18
-              
-              # Add Node to PATH permanently
-              echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc
-              echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.bashrc
-              echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc
-              
-              # Verify Node installation
-              node --version || {
-                echo "❌ Node.js installation failed"
-                exit 1
-              }
-              
-              # Install pnpm and PM2
-              echo "📦 Installing pnpm and PM2..."
-              npm install -g pnpm pm2
-              
-              # Verify installations
-              pnpm --version || {
-                echo "❌ pnpm installation failed"
-                exit 1
-              }
-              
-              pm2 --version || {
-                echo "❌ PM2 installation failed"
-                exit 1
-              }
-              
-              # Setup PM2 startup with better error handling
-              echo "🔧 Setting up PM2 startup..."
-              pm2 startup systemd -u ${{ secrets.EC2_USERNAME }} --hp /home/${{ secrets.EC2_USERNAME }} | grep -E '^sudo' | bash || {
-                echo "⚠️ PM2 startup setup failed, continuing..."
-              }
-              
-              # Configure Nginx
-              echo "🌐 Configuring Nginx..."
-              sudo systemctl enable nginx
-              sudo systemctl start nginx
-              
-              # Create Nginx config
-              sudo tee /etc/nginx/sites-available/nextjs 2>/dev/null > /dev/null << 'EOF' || sudo tee /etc/nginx/conf.d/nextjs.conf > /dev/null << 'EOF'
-              server {
-                listen 80;
-                server_name _;
-                
-                # Security headers
-                add_header X-Frame-Options "SAMEORIGIN" always;
-                add_header X-Content-Type-Options "nosniff" always;
-                add_header X-XSS-Protection "1; mode=block" always;
-                
-                # Gzip compression
-                gzip on;
-                gzip_vary on;
-                gzip_min_length 1000;
-                gzip_types
-                  text/plain
-                  text/css
-                  text/js
-                  text/xml
-                  text/javascript
-                  application/javascript
-                  application/xml+rss
-                  application/json;
-                
-                location / {
-                  proxy_pass http://127.0.0.1:3000;
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection 'upgrade';
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  proxy_cache_bypass $http_upgrade;
-                  proxy_read_timeout 86400s;
-                  proxy_send_timeout 86400s;
-                  proxy_connect_timeout 60s;
-                }
-                
-                # Static files caching
-                location /_next/static/ {
-                  proxy_pass http://127.0.0.1:3000;
-                  expires 1y;
-                  add_header Cache-Control "public, immutable";
-                }
-                
-                # Health check
-                location /health {
-                  access_log off;
-                  return 200 "healthy\n";
-                  add_header Content-Type text/plain;
-                }
-              }
-              EOF
-              
-              # Enable site (for Ubuntu/Debian)
-              if [ -f /etc/nginx/sites-available/nextjs ]; then
-                sudo ln -sf /etc/nginx/sites-available/nextjs /etc/nginx/sites-enabled/
-                sudo rm -f /etc/nginx/sites-enabled/default
-              fi
-              
-              # Test and restart Nginx
-              sudo nginx -t || {
-                echo "❌ Nginx configuration test failed"
-                exit 1
-              }
-              sudo systemctl restart nginx
-              
-              # Create application directory
-              sudo mkdir -p /var/www/nextjs-app
-              sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/www/nextjs-app
-              
-              # Create log directories
-              sudo mkdir -p /var/log/pm2
-              sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/log/pm2
-              
-              # Mark setup as complete
-              touch "$SETUP_FLAG"
-              echo "✅ Server setup completed successfully!"
-              
-            else
-              echo "✅ Server already configured, skipping setup..."
-            fi
-            
-            # Always ensure services are running
-            echo "🔄 Ensuring services are running..."
-            sudo systemctl start nginx
-            sudo systemctl status nginx --no-pager
-            
-            # Source environment
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-            
-            echo "📊 System status:"
-            echo "Node version: $(node --version)"
-            echo "npm version: $(npm --version)"
-            echo "pnpm version: $(pnpm --version)"
-            echo "PM2 version: $(pm2 --version)"
-            
+            chmod +x /tmp/setup-server.sh
+            /tmp/setup-server.sh
+            rm -f /tmp/setup-server.sh
+          
       - name: Copy deployment files
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -336,6 +361,108 @@ jobs:
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
           source: "deployment.tar.gz"
+          target: "/tmp/"
+          timeout: 300s
+
+      - name: Create deployment script
+        run: |
+          cat > deploy-app.sh << 'DEPLOY_EOF'
+          #!/bin/bash
+          echo "🚀 Starting application deployment..."
+          
+          # Source NVM
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          APP_DIR="/var/www/nextjs-app"
+          cd $APP_DIR
+          
+          # Stop existing application
+          echo "⏹️ Stopping existing application..."
+          pm2 stop nextjs-app 2>/dev/null || echo "No existing app to stop"
+          pm2 delete nextjs-app 2>/dev/null || echo "No existing app to delete"
+          
+          # Backup current deployment
+          if [ -d ".next" ]; then
+            echo "💾 Creating backup..."
+            cp -r .next .next_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+            ls -dt .next_backup_* 2>/dev/null | tail -n +4 | xargs rm -rf 2>/dev/null || true
+          fi
+          
+          # Clean old files
+          echo "🧹 Cleaning old files..."
+          rm -rf .next/ node_modules/ package.json pnpm-lock.yaml public/ ecosystem.config.js server.js scripts/ next.config.js
+          
+          # Extract new deployment
+          echo "📁 Extracting new deployment..."
+          tar -xzf /tmp/deployment.tar.gz
+          
+          # Verify extracted files
+          echo "📋 Verifying extracted files..."
+          ls -la
+          
+          if [ ! -f "package.json" ]; then
+            echo "❌ package.json not found!"
+            exit 1
+          fi
+          
+          if [ ! -d ".next" ]; then
+            echo "❌ .next directory not found!"
+            exit 1
+          fi
+          
+          if [ ! -f "server.js" ]; then
+            echo "❌ server.js not found!"
+            exit 1
+          fi
+          
+          # Install dependencies
+          echo "📦 Installing production dependencies..."
+          pnpm install --prod --frozen-lockfile || {
+            echo "❌ pnpm install failed, trying npm..."
+            npm ci --production
+          }
+          
+          # Set correct permissions
+          chmod -R 755 $APP_DIR
+          find $APP_DIR -type f -name "*.js" -exec chmod 644 {} \;
+          
+          # Make scripts executable
+          if [ -d "scripts" ]; then
+            chmod +x scripts/*.sh
+            echo "🔧 Running deployment script..."
+            [ -f "scripts/deploy-app.sh" ] && ./scripts/deploy-app.sh
+          fi
+          
+          # Start application with debugging
+          echo "🚀 Starting application with PM2..."
+          pm2 start ecosystem.config.js --env production
+          
+          # Wait for startup
+          sleep 5
+          
+          # Check if process started
+          pm2 status
+          
+          # Save PM2 configuration
+          pm2 save
+          
+          # Clean up
+          rm -f /tmp/deployment.tar.gz
+          
+          echo "✅ Application deployment completed!"
+          DEPLOY_EOF
+          
+          chmod +x deploy-app.sh
+
+      - name: Copy deployment script to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          source: "deploy-app.sh"
           target: "/tmp/"
           timeout: 300s
           
@@ -348,89 +475,9 @@ jobs:
           port: ${{ secrets.EC2_SSH_PORT }}
           timeout: 600s
           script: |
-            echo "🚀 Starting application deployment..."
-            
-            # Source NVM
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-            
-            APP_DIR="/var/www/nextjs-app"
-            cd $APP_DIR
-            
-            # Stop existing application
-            echo "⏹️ Stopping existing application..."
-            pm2 stop nextjs-app 2>/dev/null || echo "No existing app to stop"
-            pm2 delete nextjs-app 2>/dev/null || echo "No existing app to delete"
-            
-            # Backup current deployment
-            if [ -d ".next" ]; then
-              echo "💾 Creating backup..."
-              cp -r .next .next_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-              ls -dt .next_backup_* 2>/dev/null | tail -n +4 | xargs rm -rf 2>/dev/null || true
-            fi
-            
-            # Clean old files
-            echo "🧹 Cleaning old files..."
-            rm -rf .next/ node_modules/ package.json pnpm-lock.yaml public/ ecosystem.config.js server.js scripts/ next.config.js
-            
-            # Extract new deployment
-            echo "📁 Extracting new deployment..."
-            tar -xzf /tmp/deployment.tar.gz
-            
-            # Verify extracted files
-            echo "📋 Verifying extracted files..."
-            ls -la
-            
-            if [ ! -f "package.json" ]; then
-              echo "❌ package.json not found!"
-              exit 1
-            fi
-            
-            if [ ! -d ".next" ]; then
-              echo "❌ .next directory not found!"
-              exit 1
-            fi
-            
-            if [ ! -f "server.js" ]; then
-              echo "❌ server.js not found!"
-              exit 1
-            fi
-            
-            # Install dependencies
-            echo "📦 Installing production dependencies..."
-            pnpm install --prod --frozen-lockfile || {
-              echo "❌ pnpm install failed, trying npm..."
-              npm ci --production
-            }
-            
-            # Set correct permissions
-            chmod -R 755 $APP_DIR
-            find $APP_DIR -type f -name "*.js" -exec chmod 644 {} \;
-            
-            # Make scripts executable
-            if [ -d "scripts" ]; then
-              chmod +x scripts/*.sh
-              echo "🔧 Running deployment script..."
-              [ -f "scripts/deploy-app.sh" ] && ./scripts/deploy-app.sh
-            fi
-            
-            # Start application with debugging
-            echo "🚀 Starting application with PM2..."
-            pm2 start ecosystem.config.js --env production
-            
-            # Wait for startup
-            sleep 5
-            
-            # Check if process started
-            pm2 status
-            
-            # Save PM2 configuration
-            pm2 save
-            
-            # Clean up
-            rm -f /tmp/deployment.tar.gz
-            
-            echo "✅ Application deployment completed!"
+            chmod +x /tmp/deploy-app.sh
+            /tmp/deploy-app.sh
+            rm -f /tmp/deploy-app.sh
             
       - name: Health Check & Verification
         uses: appleboy/ssh-action@v1.0.3
