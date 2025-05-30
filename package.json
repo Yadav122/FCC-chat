@@ -16,7 +16,9 @@
     "lint": "next lint",
     "lint:fix": "next lint --fix",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "setup": "pnpm install && echo 'Setup complete! Run: pnpm dev'",
+    "setup-and-run": "pnpm install && pnpm dev"
   },
   "dependencies": {
     "@langchain/core": "^0.3.44",
