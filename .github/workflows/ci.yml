@@ -116,7 +116,17 @@ jobs:
               
               # Install essential packages
               echo "🛠️  Installing essential packages..."
-              sudo yum install -y curl wget git tar gzip nginx htop
+              sudo yum install -y curl wget git tar gzip nginx htop || {
+                echo "Failed to install packages, retrying with individual installs"
+                sudo yum install -y curl wget git tar gzip
+                sudo amazon-linux-extras install -y nginx || sudo yum install -y nginx
+              }
+
+              # Verify Nginx installation
+              if ! command -v nginx &> /dev/null; then
+                echo "Nginx installation failed, trying alternative method"
+                sudo amazon-linux-extras install -y nginx || sudo yum install -y nginx
+              fi
               
               # Install Node.js via NVM
               echo "📦 Installing Node.js..."
@@ -294,6 +304,26 @@ jobs:
               npm install -g pnpm
               pnpm install --prod --frozen-lockfile
             fi
+            
+            # Create ecosystem.config.js with proper environment variables
+            echo "📝 Creating ecosystem.config.js..."
+            cat > ecosystem.config.js << 'EOF'
+            module.exports = {
+              apps: [{
+                name: "nextjs-app",
+                script: "node_modules/.bin/next",
+                args: "start",
+                instances: "1",
+                autorestart: true,
+                watch: false,
+                max_memory_restart: "1G",
+                env: {
+                  NODE_ENV: "production",
+                  PORT: "3000"
+                }
+              }]
+            }
+            EOF
             
             # Set correct permissions
             chmod -R 755 $APP_DIR
