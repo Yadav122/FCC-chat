@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: Deploy Next.js to EC2
 
 on:
   push:
@@ -29,37 +29,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install
         
-      - name: Build application
+      - name: Build Next.js application
         run: pnpm build
         
       - name: List build output
         run: |
-          echo "Listing current directory:"
+          echo "Build completed. Contents:"
           ls -la
-          echo "Checking common build directories:"
-          ls -la dist/ 2>/dev/null || echo "No dist/ directory"
-          ls -la build/ 2>/dev/null || echo "No build/ directory"
-          ls -la .next/ 2>/dev/null || echo "No .next/ directory"
-          ls -la out/ 2>/dev/null || echo "No out/ directory"
+          echo "Next.js build folder:"
+          ls -la .next/
         
       - name: Create deployment archive
         run: |
-          # Check which build directory exists and use it
-          if [ -d "dist" ]; then
-            BUILD_DIR="dist"
-          elif [ -d "build" ]; then
-            BUILD_DIR="build"
-          elif [ -d ".next" ]; then
-            BUILD_DIR=".next"
-          elif [ -d "out" ]; then
-            BUILD_DIR="out"
-          else
-            echo "Error: No build directory found!"
-            exit 1
-          fi
-          
-          echo "Using build directory: $BUILD_DIR"
-          tar -czf deployment.tar.gz $BUILD_DIR/ package.json pnpm-lock.yaml
+          tar -czf deployment.tar.gz .next/ package.json pnpm-lock.yaml next.config.js public/ 2>/dev/null || tar -czf deployment.tar.gz .next/ package.json pnpm-lock.yaml
+          echo "Archive created successfully"
           
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -69,21 +52,22 @@ jobs:
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
           script: |
-            # Create application directory if it doesn't exist
+            # Create application directory
             sudo mkdir -p /var/www/myapp
             sudo chown -R ec2-user:ec2-user /var/www/myapp
             cd /var/www/myapp
             
-            # Stop existing application (if running)
+            # Stop existing application
             pm2 stop myapp || true
+            pm2 delete myapp || true
             
             # Backup current deployment
-            if [ -d "dist" ] || [ -d "build" ] || [ -d ".next" ] || [ -d "out" ]; then
-              cp -r * backup_$(date +%Y%m%d_%H%M%S)/ 2>/dev/null || true
+            if [ -d ".next" ]; then
+              cp -r .next .next_backup_$(date +%Y%m%d_%H%M%S) || true
             fi
             
             # Clean old files
-            rm -rf dist/ build/ .next/ out/ node_modules/
+            rm -rf .next/ node_modules/
             
       - name: Copy files to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -108,19 +92,41 @@ jobs:
             # Extract new files
             tar -xzf /tmp/deployment.tar.gz
             
-            # Install production dependencies (if needed)
-            # pnpm install --prod
+            # Install production dependencies
+            pnpm install --prod
+            
+            # Create ecosystem.config.js for PM2
+            cat > ecosystem.config.js << 'EOF'
+            module.exports = {
+              apps: [{
+                name: 'myapp',
+                script: 'npm',
+                args: 'start',
+                cwd: '/var/www/myapp',
+                env: {
+                  NODE_ENV: 'production',
+                  PORT: 3000
+                },
+                error_file: '/var/log/pm2/myapp-error.log',
+                out_file: '/var/log/pm2/myapp-out.log',
+                log_file: '/var/log/pm2/myapp.log'
+              }]
+            }
+            EOF
+            
+            # Create log directory
+            sudo mkdir -p /var/log/pm2
+            sudo chown -R ec2-user:ec2-user /var/log/pm2
             
             # Start application with PM2
-            pm2 start ecosystem.config.js || pm2 restart myapp
-            
-            # Save PM2 configuration
+            pm2 start ecosystem.config.js
             pm2 save
             
             # Clean up
             rm /tmp/deployment.tar.gz
             
-            echo "✅ Deployment completed successfully!"
+            echo "✅ Next.js deployment completed successfully!"
+            echo "🚀 Application running on port 3000"
             
       - name: Health Check
         uses: appleboy/ssh-action@v1.0.3
@@ -130,6 +136,8 @@ jobs:
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
           script: |
-            sleep 5
+            sleep 10
             pm2 status myapp
-            echo "🚀 Application is running!"
+            echo "Checking if app is responding..."
+            curl -f http://localhost:3000 || echo "App not responding yet, check logs with: pm2 logs myapp"
+            echo "🌐 App URL: http://ec2-35-162-98-50.us-west-2.compute.amazonaws.com:3000"
