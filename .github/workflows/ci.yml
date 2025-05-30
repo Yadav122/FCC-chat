@@ -27,6 +27,15 @@ jobs:
         run: pnpm install
       - name: Check formatting
         run: pnpm format:check
+      - name: Auto-fix formatting (if check fails)
+        if: failure()
+        run: |
+          pnpm format
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git diff --staged --quiet || git commit -m "Auto-fix formatting issues"
+          git push || true
 
   lint:
     name: Check linting
@@ -55,7 +64,6 @@ jobs:
           ignore_words_file: .codespellignore
           path: README.md
 
-          
   check-spelling:
     name: Check code spelling
     runs-on: ubuntu-latest
