@@ -241,4 +241,5 @@ const streamValue = useTypedStream({
 });
 ```
 #   F C C - C h a t - U I  
+ #   F C C - c h a t  
  
