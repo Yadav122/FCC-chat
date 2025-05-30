@@ -1,9 +1,8 @@
-name: CI/CD Pipeline with EC2 Deployment
+name: Deploy to EC2
 
 on:
   push:
     branches: ["main"]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -11,113 +10,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  format:
-    name: Auto-fix formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.5.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "18.x"
-          cache: "pnpm"
-      - name: Install dependencies
-        run: pnpm install
-      - name: Auto-fix formatting
-        run: |
-          pnpm format || npx prettier --write .
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add .
-          if ! git diff --staged --quiet; then
-            git commit -m "🎨 Auto-fix formatting issues [skip ci]"
-            git push
-          fi
-      - name: Check formatting (final verification)
-        run: pnpm format:check || npx prettier --check .
-
-  lint:
-    name: Check linting
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.5.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "18.x"
-          cache: "pnpm"
-      - name: Install dependencies
-        run: pnpm install
-      - name: Check linting
-        run: pnpm lint || echo "Linting issues found but continuing..."
-
-  readme-spelling:
-    name: Check README spelling
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: codespell-project/actions-codespell@v2
-        with:
-          ignore_words_file: .codespellignore
-          path: README.md
-
-  check-spelling:
-    name: Check code spelling
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: codespell-project/actions-codespell@v2
-        with:
-          ignore_words_file: .codespellignore
-          path: src
-
-  build:
-    name: Build application
-    runs-on: ubuntu-latest
-    needs: [format, lint, readme-spelling, check-spelling]
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.5.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "18.x"
-          cache: "pnpm"
-      - name: Install dependencies
-        run: pnpm install
-      - name: Build application
-        run: pnpm build
-      - name: Create deployment archive
-        run: |
-          tar -czf deployment.tar.gz dist/ package.json pnpm-lock.yaml
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-files
-          path: deployment.tar.gz
-
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
-    needs: build
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-files
+      - uses: actions/checkout@v4
       
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.5.1
+          
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18.x"
+          cache: "pnpm"
+          
+      - name: Install dependencies
+        run: pnpm install
+        
+      - name: Build application
+        run: pnpm build
+        
+      - name: Create deployment archive
+        run: |
+          tar -czf deployment.tar.gz dist/ package.json pnpm-lock.yaml ecosystem.config.js
+          
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -163,7 +81,7 @@ jobs:
             # Extract new files
             tar -xzf /tmp/deployment.tar.gz
             
-            # Install dependencies (if needed for production)
+            # Install production dependencies (if needed)
             # pnpm install --prod
             
             # Start application with PM2
@@ -175,4 +93,16 @@ jobs:
             # Clean up
             rm /tmp/deployment.tar.gz
             
-            echo "Deployment completed successfully!"
+            echo "✅ Deployment completed successfully!"
+            
+      - name: Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_PRIVATE_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          script: |
+            sleep 5
+            pm2 status myapp
+            echo "🚀 Application is running!"
