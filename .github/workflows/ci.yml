@@ -66,6 +66,30 @@ jobs:
           }
           EOF
 
+          # Create alternative ecosystem config for built-in Next.js start
+          cat > ecosystem-nextjs.config.js << 'EOF'
+          module.exports = {
+            apps: [{
+              name: "nextjs-app",
+              script: "npm",
+              args: "start",
+              instances: 1,
+              autorestart: true,
+              watch: false,
+              max_memory_restart: "1G",
+              env: {
+                NODE_ENV: "production",
+                PORT: 3000,
+                HOSTNAME: "0.0.0.0"
+              },
+              error_file: "/var/log/pm2/nextjs-app-error.log",
+              out_file: "/var/log/pm2/nextjs-app-out.log",
+              log_file: "/var/log/pm2/nextjs-app-combined.log",
+              time: true
+            }]
+          }
+          EOF
+
           # Create a standalone server.js file (ES Module compatible)
           cat > server.js << 'EOF'
           import { createServer } from 'http'
@@ -120,6 +144,7 @@ jobs:
             pnpm-lock.yaml \
             public/ \
             ecosystem.config.js \
+            ecosystem-nextjs.config.js \
             server.js \
             scripts/ \
             $([ -f "next.config.js" ] && echo "next.config.js" || echo "") \
@@ -395,7 +420,7 @@ jobs:
 
           # Clean old files
           echo "🧹 Cleaning old files..."
-          rm -rf .next/ node_modules/ package.json pnpm-lock.yaml public/ ecosystem.config.js server.js scripts/ next.config.js next.config.mjs
+          rm -rf .next/ node_modules/ package.json pnpm-lock.yaml public/ ecosystem.config.js ecosystem-nextjs.config.js server.js scripts/ next.config.js next.config.mjs
 
           # Extract new deployment
           echo "📁 Extracting new deployment..."
@@ -421,14 +446,36 @@ jobs:
           fi
 
           # Install dependencies
-          echo "📦 Installing production dependencies..."
-          pnpm install --prod --frozen-lockfile || {
-            echo "❌ pnpm install failed, trying npm..."
-            npm ci --production || {
-              echo "❌ npm install also failed, trying basic npm install..."
-              npm install --production
+          echo "📦 Installing dependencies..."
+
+          # First try pnpm with all dependencies (not just production)
+          pnpm install --frozen-lockfile || {
+            echo "❌ pnpm install failed, trying without frozen lockfile..."
+            pnpm install || {
+              echo "❌ pnpm install failed completely, trying npm..."
+              npm ci || {
+                echo "❌ npm ci failed, trying basic npm install..."
+                npm install || {
+                  echo "❌ All package managers failed!"
+                  exit 1
+                }
+              }
             }
           }
+
+          # Verify Next.js is installed
+          echo "🔍 Verifying Next.js installation..."
+          if [ -d "node_modules/next" ]; then
+            echo "✅ Next.js found in node_modules"
+            ls -la node_modules/next/package.json
+          else
+            echo "❌ Next.js not found, installing manually..."
+            pnpm add next || npm install next
+          fi
+
+          # Show installed packages for debugging
+          echo "📋 Installed packages:"
+          ls -la node_modules/ | head -10
 
           # Set correct permissions
           chmod -R 755 $APP_DIR
@@ -453,14 +500,17 @@ jobs:
 
           # Start with PM2
           pm2 start ecosystem.config.js --env production || {
-            echo "❌ PM2 start failed, checking logs..."
+            echo "❌ PM2 start with custom server failed, checking logs..."
             pm2 logs nextjs-app --lines 20 --nostream || true
-            echo "Trying to start with direct command..."
-            pm2 start server.js --name nextjs-app --env production || {
-              echo "❌ Direct PM2 start also failed, trying Next.js built-in start..."
-              pm2 start "pnpm start" --name nextjs-app --env production || {
-                echo "❌ All PM2 start methods failed"
-                exit 1
+            echo "Trying alternative ecosystem config with built-in Next.js start..."
+            pm2 start ecosystem-nextjs.config.js --env production || {
+              echo "❌ Alternative ecosystem config failed, trying direct commands..."
+              pm2 start "npm start" --name nextjs-app --env production || {
+                echo "❌ npm start failed, trying pnpm start..."
+                pm2 start "pnpm start" --name nextjs-app --env production || {
+                  echo "❌ All PM2 start methods failed"
+                  exit 1
+                }
               }
             }
           }
