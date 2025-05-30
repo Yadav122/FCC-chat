@@ -641,6 +641,16 @@ jobs:
                 pm2 status | head -5
                 netstat -tlnp 2>/dev/null | grep :3000 || echo "Port 3000 not listening"
                 
+                # Check if package.json has type:module and rename ecosystem files if needed
+                if grep -q '"type": "module"' /var/www/nextjs-app/package.json; then
+                  echo "📝 Detected ESM project, renaming ecosystem files to .cjs..."
+                  [ -f "ecosystem.config.js" ] && mv ecosystem.config.js ecosystem.config.cjs
+                  [ -f "ecosystem-nextjs.config.js" ] && mv ecosystem-nextjs.config.js ecosystem-nextjs.config.cjs
+                  # Update PM2 commands to use .cjs files
+                  sed -i 's/ecosystem.config.js/ecosystem.config.cjs/g' /tmp/deploy-app.sh
+                  sed -i 's/ecosystem-nextjs.config.js/ecosystem-nextjs.config.cjs/g' /tmp/deploy-app.sh
+                fi
+                
                 # Verify Nginx configuration
                 echo "🔍 Checking Nginx configuration..."
                 sudo nginx -t
