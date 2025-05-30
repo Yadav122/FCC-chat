@@ -1,4 +1,4 @@
-name: Deploy Next.js to EC2
+name: Fully Automated Next.js Deployment
 
 on:
   push:
@@ -11,17 +11,21 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy to EC2
+    name: Deploy to EC2 with Auto Setup
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
       
-      - uses: pnpm/action-setup@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
           version: 10.5.1
           
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
           cache: "pnpm"
@@ -30,46 +34,175 @@ jobs:
         run: pnpm install
         
       - name: Build Next.js application
-        run: pnpm build
-        
-      - name: List build output
         run: |
-          echo "Build completed. Contents:"
-          ls -la
-          echo "Next.js build folder:"
-          ls -la .next/
+          echo "🔨 Building Next.js application..."
+          pnpm build
+          echo "✅ Build completed successfully"
         
-      - name: Create deployment archive
+      - name: Create deployment package
         run: |
-          tar -czf deployment.tar.gz .next/ package.json pnpm-lock.yaml next.config.js public/ 2>/dev/null || tar -czf deployment.tar.gz .next/ package.json pnpm-lock.yaml
-          echo "Archive created successfully"
+          echo "📦 Creating deployment package..."
+          tar -czf deployment.tar.gz \
+            .next/ \
+            package.json \
+            pnpm-lock.yaml \
+            public/ \
+            ecosystem.config.js \
+            scripts/ \
+            next.config.js 2>/dev/null || \
+          tar -czf deployment.tar.gz \
+            .next/ \
+            package.json \
+            pnpm-lock.yaml \
+            public/ \
+            ecosystem.config.js \
+            scripts/
           
-      - name: Deploy to EC2
+          echo "✅ Deployment package created ($(du -h deployment.tar.gz | cut -f1))"
+          
+      - name: Setup Server (First Time Only)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
+          timeout: 600s
           script: |
-            # Create application directory
-            sudo mkdir -p /var/www/myapp
-            sudo chown -R ec2-user:ec2-user /var/www/myapp
-            cd /var/www/myapp
+            echo "🚀 Starting automated server setup..."
             
-            # Stop existing application
-            pm2 stop myapp || true
-            pm2 delete myapp || true
+            # Create setup flag to avoid repeated setup
+            SETUP_FLAG="/home/${{ secrets.EC2_USERNAME }}/.server_setup_complete"
             
-            # Backup current deployment
-            if [ -d ".next" ]; then
-              cp -r .next .next_backup_$(date +%Y%m%d_%H%M%S) || true
+            if [ ! -f "$SETUP_FLAG" ]; then
+              echo "🔧 First time setup - Installing all dependencies..."
+              
+              # Update system
+              echo "📦 Updating system packages..."
+              sudo yum update -y
+              
+              # Install essential packages
+              echo "🛠️  Installing essential packages..."
+              sudo yum install -y curl wget git tar gzip nginx htop
+              
+              # Install Node.js via NVM
+              echo "📦 Installing Node.js..."
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+              export NVM_DIR="$HOME/.nvm"
+              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+              [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+              nvm install 18
+              nvm use 18
+              nvm alias default 18
+              
+              # Add Node to PATH permanently
+              echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc
+              echo '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"' >> ~/.bashrc
+              echo '[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"' >> ~/.bashrc
+              
+              # Install pnpm
+              echo "📦 Installing pnpm..."
+              npm install -g pnpm
+              
+              # Install PM2
+              echo "📦 Installing PM2..."
+              npm install -g pm2
+              
+              # Setup PM2 startup
+              pm2 startup systemd -u ${{ secrets.EC2_USERNAME }} --hp /home/${{ secrets.EC2_USERNAME }}
+              sudo env PATH=$PATH:/home/${{ secrets.EC2_USERNAME }}/.nvm/versions/node/$(node -v)/bin /home/${{ secrets.EC2_USERNAME }}/.nvm/versions/node/$(node -v)/lib/node_modules/pm2/bin/pm2 startup systemd -u ${{ secrets.EC2_USERNAME }} --hp /home/${{ secrets.EC2_USERNAME }}
+              
+              # Configure Nginx
+              echo "🌐 Configuring Nginx..."
+              sudo systemctl start nginx
+              sudo systemctl enable nginx
+              
+              # Create Nginx config for Next.js
+              sudo tee /etc/nginx/conf.d/nextjs.conf > /dev/null << 'EOF'
+            server {
+              listen 80;
+              server_name _;
+              
+              # Gzip compression
+              gzip on;
+              gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+              
+              location / {
+                proxy_pass http://localhost:3000;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+                proxy_read_timeout 86400s;
+                proxy_send_timeout 86400s;
+              }
+              
+              # Static files caching
+              location /_next/static/ {
+                proxy_pass http://localhost:3000;
+                proxy_cache_valid 200 1y;
+                add_header Cache-Control "public, immutable";
+              }
+              
+              # Health check endpoint
+              location /health {
+                access_log off;
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+              }
+            }
+            EOF
+              
+              # Test and restart Nginx
+              sudo nginx -t
+              sudo systemctl restart nginx
+              
+              # Create application directory
+              sudo mkdir -p /var/www/nextjs-app
+              sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/www/nextjs-app
+              
+              # Create log directories
+              sudo mkdir -p /var/log/pm2
+              sudo chown -R ${{ secrets.EC2_USERNAME }}:${{ secrets.EC2_USERNAME }} /var/log/pm2
+              
+              # Setup firewall (optional)
+              echo "🔥 Configuring firewall..."
+              sudo yum install -y firewalld
+              sudo systemctl start firewalld
+              sudo systemctl enable firewalld
+              sudo firewall-cmd --permanent --add-port=80/tcp
+              sudo firewall-cmd --permanent --add-port=443/tcp
+              sudo firewall-cmd --permanent --add-port=3000/tcp
+              sudo firewall-cmd --reload
+              
+              # Mark setup as complete
+              touch "$SETUP_FLAG"
+              echo "✅ Server setup completed successfully!"
+              
+            else
+              echo "✅ Server already configured, skipping setup..."
             fi
             
-            # Clean old files
-            rm -rf .next/ node_modules/
+            # Always ensure services are running
+            echo "🔄 Ensuring services are running..."
+            sudo systemctl start nginx
+            sudo systemctl status nginx
             
-      - name: Copy files to EC2
+            # Source environment for current session
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            
+            echo "📊 System status:"
+            echo "Node version: $(node --version 2>/dev/null || echo 'Not found')"
+            echo "npm version: $(npm --version 2>/dev/null || echo 'Not found')"
+            echo "pnpm version: $(pnpm --version 2>/dev/null || echo 'Not found')"
+            echo "PM2 version: $(pm2 --version 2>/dev/null || echo 'Not found')"
+            
+      - name: Copy deployment files
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -78,66 +211,160 @@ jobs:
           port: ${{ secrets.EC2_SSH_PORT }}
           source: "deployment.tar.gz"
           target: "/tmp/"
+          timeout: 300s
           
-      - name: Extract and start application
+      - name: Deploy Application
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
+          timeout: 600s
           script: |
-            cd /var/www/myapp
+            echo "🚀 Starting application deployment..."
             
-            # Extract new files
+            # Source NVM for current session
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            
+            APP_DIR="/var/www/nextjs-app"
+            cd $APP_DIR
+            
+            # Stop existing application
+            echo "⏹️  Stopping existing application..."
+            pm2 stop nextjs-app 2>/dev/null || echo "No existing app to stop"
+            pm2 delete nextjs-app 2>/dev/null || echo "No existing app to delete"
+            
+            # Backup current deployment
+            if [ -d ".next" ]; then
+              echo "💾 Creating backup..."
+              cp -r .next .next_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+              # Keep only last 3 backups
+              ls -dt .next_backup_* 2>/dev/null | tail -n +4 | xargs rm -rf 2>/dev/null || true
+            fi
+            
+            # Clean old files
+            echo "🧹 Cleaning old files..."
+            rm -rf .next/ node_modules/ package.json pnpm-lock.yaml public/ ecosystem.config.js scripts/ next.config.js
+            
+            # Extract new deployment
+            echo "📁 Extracting new deployment..."
             tar -xzf /tmp/deployment.tar.gz
             
-            # Install production dependencies
-            pnpm install --prod
+            # Install dependencies
+            echo "📦 Installing production dependencies..."
+            if command -v pnpm &> /dev/null; then
+              pnpm install --prod --frozen-lockfile
+            else
+              echo "pnpm not found, installing..."
+              npm install -g pnpm
+              pnpm install --prod --frozen-lockfile
+            fi
             
-            # Create ecosystem.config.js for PM2
-            cat > ecosystem.config.js << 'EOF'
-            module.exports = {
-              apps: [{
-                name: 'myapp',
-                script: 'npm',
-                args: 'start',
-                cwd: '/var/www/myapp',
-                env: {
-                  NODE_ENV: 'production',
-                  PORT: 3000
-                },
-                error_file: '/var/log/pm2/myapp-error.log',
-                out_file: '/var/log/pm2/myapp-out.log',
-                log_file: '/var/log/pm2/myapp.log'
-              }]
-            }
-            EOF
+            # Set correct permissions
+            chmod -R 755 $APP_DIR
+            find $APP_DIR -type f -name "*.js" -exec chmod 644 {} \;
             
-            # Create log directory
-            sudo mkdir -p /var/log/pm2
-            sudo chown -R ec2-user:ec2-user /var/log/pm2
+            # Make scripts executable
+            if [ -d "scripts" ]; then
+              chmod +x scripts/*.sh
+              echo "🔧 Running deployment script..."
+              [ -f "scripts/deploy-app.sh" ] && ./scripts/deploy-app.sh
+            fi
             
-            # Start application with PM2
+            # Start application
+            echo "🚀 Starting application with PM2..."
             pm2 start ecosystem.config.js
             pm2 save
             
             # Clean up
-            rm /tmp/deployment.tar.gz
+            rm -f /tmp/deployment.tar.gz
             
-            echo "✅ Next.js deployment completed successfully!"
-            echo "🚀 Application running on port 3000"
+            echo "✅ Application deployment completed!"
             
-      - name: Health Check
+      - name: Health Check & Verification
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           port: ${{ secrets.EC2_SSH_PORT }}
+          timeout: 180s
           script: |
-            sleep 10
-            pm2 status myapp
-            echo "Checking if app is responding..."
-            curl -f http://localhost:3000 || echo "App not responding yet, check logs with: pm2 logs myapp"
-            echo "🌐 App URL: http://ec2-35-162-98-50.us-west-2.compute.amazonaws.com:3000"
+            echo "🔍 Performing comprehensive health checks..."
+            
+            # Wait for application to start
+            echo "⏳ Waiting for application to start..."
+            sleep 20
+            
+            # Check PM2 status
+            echo "📊 PM2 Status:"
+            pm2 status
+            
+            # Check if application is listening on port 3000
+            echo "🔌 Checking if port 3000 is listening..."
+            netstat -tlnp | grep :3000 || echo "⚠️  Port 3000 not listening yet"
+            
+            # Check Nginx status
+            echo "🌐 Nginx Status:"
+            sudo systemctl status nginx --no-pager
+            
+            # Health check attempts
+            echo "🏥 Application health check..."
+            HEALTH_CHECK_PASSED=false
+            
+            for i in {1..10}; do
+              echo "Attempt $i/10: Testing http://localhost:3000"
+              
+              if curl -f -s --max-time 10 http://localhost:3000 >/dev/null 2>&1; then
+                echo "✅ Direct connection successful!"
+                HEALTH_CHECK_PASSED=true
+                break
+              elif curl -f -s --max-time 10 http://localhost >/dev/null 2>&1; then
+                echo "✅ Nginx proxy connection successful!"
+                HEALTH_CHECK_PASSED=true
+                break
+              else
+                echo "⏳ Attempt $i failed, waiting 5 seconds..."
+                sleep 5
+              fi
+            done
+            
+            if [ "$HEALTH_CHECK_PASSED" = true ]; then
+              echo "🎉 Health check PASSED!"
+            else
+              echo "❌ Health check FAILED!"
+              echo "📝 Checking logs for debugging..."
+              pm2 logs nextjs-app --lines 20 --nostream || echo "No PM2 logs available"
+            fi
+            
+            # System resource check
+            echo "💻 System Resources:"
+            echo "Memory usage: $(free -h | grep '^Mem' | awk '{print $3 "/" $2}')"
+            echo "Disk usage: $(df -h / | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')"
+            echo "CPU load: $(uptime | awk -F'load average:' '{print $2}')"
+            
+            # Final status report
+            echo ""
+            echo "🎯 DEPLOYMENT SUMMARY:"
+            echo "====================="
+            echo "🌐 Application URLs:"
+            echo "   Direct: http://${{ secrets.EC2_HOST }}:3000"
+            echo "   Nginx:  http://${{ secrets.EC2_HOST }}"
+            echo ""
+            echo "🛠️  Management Commands:"
+            echo "   pm2 logs nextjs-app          # View logs"
+            echo "   pm2 restart nextjs-app       # Restart app"
+            echo "   pm2 status                   # Check status"
+            echo "   sudo systemctl status nginx  # Check Nginx"
+            echo ""
+            
+            if [ "$HEALTH_CHECK_PASSED" = true ]; then
+              echo "🎉 DEPLOYMENT SUCCESSFUL! 🎉"
+              exit 0
+            else
+              echo "❌ DEPLOYMENT COMPLETED WITH ISSUES"
+              echo "Check the logs above for debugging information"
+              exit 1
+            fi
