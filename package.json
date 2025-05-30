@@ -11,7 +11,7 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "your-build-command --out-dir dist",
+    "build": "next build",
     "start": "next start",
     "lint": "next lint",
     "lint:fix": "next lint --fix",
