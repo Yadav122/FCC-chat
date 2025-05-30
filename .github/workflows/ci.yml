@@ -640,6 +640,14 @@ jobs:
                 echo "🔍 Debug info at attempt $i:"
                 pm2 status | head -5
                 netstat -tlnp 2>/dev/null | grep :3000 || echo "Port 3000 not listening"
+                
+                # Verify Nginx configuration
+                echo "🔍 Checking Nginx configuration..."
+                sudo nginx -t
+                
+                # Ensure Nginx is properly configured to proxy to port 3000
+                echo "🔄 Verifying Nginx proxy configuration..."
+                grep -r "proxy_pass.*3000" /etc/nginx/
               fi
 
               echo "⏳ Attempt $i failed, waiting 5 seconds..."
